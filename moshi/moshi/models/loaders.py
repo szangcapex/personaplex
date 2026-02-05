@@ -316,8 +316,19 @@ def get_moshi_lm(
     
     # Copy to avoid mutating a shared/global dict
     lm_kwargs = dict(_lm_kwargs)
-    lm_kwargs["dep_q"] = 16
-    logger.info(f"Modified dep_q from 8 to 16")
+    
+    # IMPORTANT: Check if we should modify dep_q based on checkpoint
+    # Original model has dep_q=8, but some checkpoints may have different values
+    if filename is not None:
+        logger.info(f"Original dep_q in config: {lm_kwargs['dep_q']}")
+        # We'll inspect the checkpoint to determine the actual dep_q
+        # For now, keeping the modification but adding a warning
+        lm_kwargs["dep_q"] = 16
+        logger.warning(f"Modified dep_q from 8 to 16 - this may cause issues if checkpoint was trained with dep_q=8")
+        logger.warning(f"Missing embeddings will be copied from existing ones, which may affect audio quality")
+    else:
+        lm_kwargs["dep_q"] = 16
+        logger.info(f"Modified dep_q from 8 to 16")
     
     if delays is not None:
         lm_kwargs["delays"] = delays
@@ -359,11 +370,29 @@ def get_moshi_lm(
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
     
-    logger.info(f"Checkpoint loaded, contains {len(state_dict)} keys")
+    logger.info(f"Checkpoint loaded with {len(state_dict)} keys")
     
     # Calculate checkpoint size
     checkpoint_size = sum(t.numel() * t.element_size() for t in state_dict.values())
     logger.info(f"Checkpoint total size: {checkpoint_size / (1024**2):.2f} MB ({checkpoint_size / (1024**3):.4f} GB)")
+    
+    # Detect actual dep_q from checkpoint
+    depformer_emb_keys = [k for k in state_dict.keys() if k.startswith('depformer_emb.') and k.endswith('.weight')]
+    if depformer_emb_keys:
+        # Extract indices from keys like "depformer_emb.0.weight"
+        indices = []
+        for key in depformer_emb_keys:
+            parts = key.split('.')
+            if len(parts) >= 2 and parts[1].isdigit():
+                indices.append(int(parts[1]))
+        actual_dep_q_in_checkpoint = max(indices) + 1 if indices else None
+        logger.info(f"Detected dep_q in checkpoint: {actual_dep_q_in_checkpoint} (indices: {sorted(indices)})")
+        logger.info(f"Model expects dep_q: {lm_kwargs['dep_q']}")
+        
+        if actual_dep_q_in_checkpoint and actual_dep_q_in_checkpoint < lm_kwargs['dep_q']:
+            logger.warning(f"⚠️  MISMATCH: Checkpoint has dep_q={actual_dep_q_in_checkpoint} but model expects {lm_kwargs['dep_q']}")
+            logger.warning(f"⚠️  Missing {lm_kwargs['dep_q'] - actual_dep_q_in_checkpoint} embeddings will be copied from existing ones")
+            logger.warning(f"⚠️  This may affect model performance and audio quality!")
     
     # Get model state dict for comparison
     model_sd = model.state_dict()
@@ -414,6 +443,30 @@ def get_moshi_lm(
                         break
                 if replaced:
                     break
+            
+            # If still not replaced, try to find ANY available source from index 0-7
+            if not replaced and name not in state_dict:
+                for rep in to_replace:
+                    # Extract the pattern like "depformer_emb.7.weight"
+                    if f"{rep}." in name:
+                        # Try to find any available source with index 0-7
+                        for fallback_idx in range(8):
+                            # Extract the base pattern by replacing the index
+                            import re
+                            pattern = rf"{rep}\.(\d+)\."
+                            match = re.search(pattern, name)
+                            if match:
+                                fallback_src = name.replace(f"{rep}.{match.group(1)}.", f"{rep}.{fallback_idx}.")
+                                if fallback_src in state_dict:
+                                    logger.info(f"Replacing {name} <- {fallback_src} (fallback)")
+                                    logger.info(f"  Shape: {state_dict[fallback_src].shape}, dtype: {state_dict[fallback_src].dtype}")
+                                    state_dict[name] = state_dict[fallback_src]
+                                    replaced = True
+                                    patch2_count += 1
+                                    break
+                        if replaced:
+                            break
+            
             if not replaced and name not in state_dict:
                 logger.warning(f"Missing {name} (shape: {model_sd[name].shape})")
     
