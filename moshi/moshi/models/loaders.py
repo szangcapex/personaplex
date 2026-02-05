@@ -26,7 +26,8 @@ from pathlib import Path
 import logging
 from safetensors.torch import load_model, load_file
 import torch
-logger = logging.getLogger(__name__)
+from ..utils.logging import setup_logger
+logger = setup_logger(__name__)
 from .compression import MimiModel
 from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
